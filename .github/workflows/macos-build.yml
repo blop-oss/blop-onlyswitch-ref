@@ -1,0 +1,143 @@
+name: macOS build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: macos-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Unsigned build and test on macOS
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DERIVED_DATA: ${{ github.workspace }}/.ci/DerivedData
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Discover installed Xcode toolchains
+        run: |
+          set -euo pipefail
+          ls /Applications | grep '^Xcode' || true
+          echo
+          echo "Xcode and Swift versions available on this image:"
+          for app in /Applications/Xcode*.app; do
+            xcodebuild_bin="$app/Contents/Developer/usr/bin/xcodebuild"
+            swift_bin="$app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift"
+            if [ ! -x "$xcodebuild_bin" ] || [ ! -x "$swift_bin" ]; then
+              continue
+            fi
+            xcode_version="$("$xcodebuild_bin" -version | awk '/^Xcode/ {print $2; exit}')"
+            swift_version="$("$swift_bin" --version 2>/dev/null | grep -oE 'version [0-9]+(\.[0-9]+)+' | head -1 | grep -oE '[0-9]+(\.[0-9]+)+')"
+            echo "$(basename "$app") | Xcode ${xcode_version:-unknown} | Swift ${swift_version:-unknown}"
+          done
+
+      - name: Select the newest Xcode with Swift 6.2 or later
+        run: |
+          set -euo pipefail
+          best_app=""
+          best_xcode=""
+          best_swift=""
+          for app in /Applications/Xcode*.app; do
+            xcodebuild_bin="$app/Contents/Developer/usr/bin/xcodebuild"
+            swift_bin="$app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift"
+            if [ ! -x "$xcodebuild_bin" ] || [ ! -x "$swift_bin" ]; then
+              continue
+            fi
+            xcode_version="$("$xcodebuild_bin" -version | awk '/^Xcode/ {print $2; exit}')"
+            swift_version="$("$swift_bin" --version 2>/dev/null | grep -oE 'version [0-9]+(\.[0-9]+)+' | head -1 | grep -oE '[0-9]+(\.[0-9]+)+')"
+            if [ -z "$xcode_version" ] || [ -z "$swift_version" ]; then
+              continue
+            fi
+            # Keep only toolchains whose Swift is at least 6.2, the package's swift-tools-version.
+            if [ "$(printf '%s\n6.2\n' "$swift_version" | sort -V | head -1)" != "6.2" ]; then
+              continue
+            fi
+            if [ -z "$best_app" ] || [ "$(printf '%s\n%s\n' "$xcode_version" "$best_xcode" | sort -V | tail -1)" = "$xcode_version" ]; then
+              best_app="$app"
+              best_xcode="$xcode_version"
+              best_swift="$swift_version"
+            fi
+          done
+          if [ -z "$best_app" ]; then
+            echo "::error::No installed Xcode provides Swift 6.2 or later, which Modules/Package.swift requires."
+            exit 1
+          fi
+          echo "Selected $best_app (Xcode $best_xcode, Swift $best_swift)"
+          sudo xcode-select -s "$best_app"
+          echo "XCODE_VERSION=$best_xcode" >> "$GITHUB_ENV"
+          echo "SWIFT_VERSION=$best_swift" >> "$GITHUB_ENV"
+          {
+            echo "## Toolchain pinned for this run"
+            echo ""
+            echo "| Setting | Value |"
+            echo "| --- | --- |"
+            echo "| Xcode | ${best_xcode} (${best_app}) |"
+            echo "| Swift | ${best_swift} |"
+            echo "| Runner | ${RUNNER_NAME:-macos-15} |"
+            echo "| Signing | disabled, CODE_SIGNING_ALLOWED=NO |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          xcodebuild -version
+          swift --version
+
+      - name: Compute package hash for the cache key
+        id: cache-keys
+        run: |
+          set -euo pipefail
+          pkg_hash="$(shasum -a 256 Modules/Package.swift | cut -d ' ' -f1)"
+          echo "pkg_hash=$pkg_hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DERIVED_DATA }}
+          key: xcodebuild-${{ env.XCODE_VERSION }}-pkg-${{ steps.cache-keys.outputs.pkg_hash }}-${{ github.sha }}
+          restore-keys: |
+            xcodebuild-${{ env.XCODE_VERSION }}-pkg-${{ steps.cache-keys.outputs.pkg_hash }}-
+            xcodebuild-${{ env.XCODE_VERSION }}-pkg-
+
+      - name: Build the OnlySwitch scheme
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project OnlySwitch.xcodeproj \
+            -scheme OnlySwitch \
+            -destination 'platform=macOS' \
+            -configuration Debug \
+            -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath "$RUNNER_TEMP/build.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee build.log | { command -v xcbeautify >/dev/null 2>&1 && xcbeautify || cat; }
+
+      - name: Test the OnlySwitch scheme
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project OnlySwitch.xcodeproj \
+            -scheme OnlySwitch \
+            -destination 'platform=macOS' \
+            -configuration Debug \
+            -derivedDataPath "$DERIVED_DATA" \
+            -resultBundlePath "$RUNNER_TEMP/test.xcresult" \
+            CODE_SIGNING_ALLOWED=NO \
+            test 2>&1 | tee test.log | { command -v xcbeautify >/dev/null 2>&1 && xcbeautify || cat; }
+
+      - name: Upload logs and result bundles on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build-logs-${{ github.run_id }}
+          path: |
+            build.log
+            test.log
+            ${{ runner.temp }}/build.xcresult
+            ${{ runner.temp }}/test.xcresult
+          if-no-files-found: warn
+          retention-days: 14
